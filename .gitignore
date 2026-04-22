@@ -1,0 +1,11 @@
+.DS_Store
+__pycache__/
+*.pyc
+DiffusionDrive/
+*.egg-info/
+.env
+findings
+findings-2
+findings-3
+findings-4
+findings-5

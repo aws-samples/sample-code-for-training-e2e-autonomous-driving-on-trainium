@@ -1,0 +1,577 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  One-click deployment for DiffusionDrive End-to-End Autonomous Driving training on AWS Trainium.
+  Provisions a trn1.32xlarge instance with Neuron SDK, deploys model code, and runs benchmarks.
+  All results are uploaded to S3 and logged to CloudWatch.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  InstanceType:
+    Type: String
+    Default: trn1.32xlarge
+    AllowedValues:
+      - trn1.32xlarge
+      - trn1.2xlarge
+    Description: Trainium instance type (trn1.32xlarge recommended for full benchmarks)
+
+  NeuronAmiId:
+    Type: String
+    Default: ami-0fd664467b3cf8dfd
+    Description: >
+      Neuron DLAMI AMI ID. Default is Deep Learning AMI Neuron (Ubuntu 22.04) 20260227.
+      Find latest: aws ec2 describe-images --owners amazon --filters "Name=name,Values=Deep Learning AMI Neuron*Ubuntu 22.04*" --query 'Images|sort_by(@,&CreationDate)|[-1].ImageId' --output text
+
+  KeyPairName:
+    Type: String
+    Default: ''
+    Description: (Optional) EC2 key pair for SSH access. Leave blank for SSM-only access.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to launch the instance in
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet to launch the instance in (must have internet access for S3/SSM)
+
+  TTLHours:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    MaxValue: 24
+    Description: Auto-terminate the instance after this many hours (cost safety)
+
+  GitRepoUrl:
+    Type: String
+    MinLength: 1
+    AllowedPattern: '^https?://.+\.git$|^git@.+:.+\.git$'
+    ConstraintDescription: GitRepoUrl must be a non-empty Git URL ending in .git
+    Description: >
+      Git repository URL that hosts this sample. Required; provide it as
+      a CloudFormation parameter (for example, your organization's fork URL).
+
+  RunBenchmark:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether to automatically run benchmarks after provisioning
+
+  EbsVolumeSize:
+    Type: Number
+    Default: 500
+    MinValue: 200
+    MaxValue: 2000
+    Description: EBS volume size in GB (500+ recommended for dataset + compile cache)
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+Conditions:
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # =========================================================================
+  # Amazon S3 bucket for access logs
+  # =========================================================================
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: This bucket is itself the access-log destination for the artifact bucket; enabling access logging on the log bucket creates recursive log writes.
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: This bucket is the S3 access-log destination for the artifact bucket; enabling access logging on the log bucket itself creates recursive log writes.
+    Properties:
+      BucketName: !Sub 'diffusiondrive-logs-${AWS::StackName}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireLogs
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Project
+          Value: end-2end-AI
+
+  # =========================================================================
+  # S3 bucket policy for AccessLogsBucket — enforce SSL
+  # =========================================================================
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonSSLRequests
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AccessLogsBucket.Arn
+              - !Sub '${AccessLogsBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # =========================================================================
+  # S3 bucket policy for AccessLogsBucket — enforce SSL
+  # =========================================================================
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonSSLRequests
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AccessLogsBucket.Arn
+              - !Sub '${AccessLogsBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # =========================================================================
+  # Amazon S3 bucket for artifacts (model checkpoints, benchmark results, logs)
+  # =========================================================================
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    DependsOn: AccessLogsBucket
+    Properties:
+      BucketName: !Sub 'diffusiondrive-${AWS::StackName}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: artifact-access-logs/
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpirationInDays: 7
+      Tags:
+        - Key: Project
+          Value: end-2end-AI
+        - Key: Stack
+          Value: !Ref AWS::StackName
+
+  # =========================================================================
+  # S3 bucket policy for ArtifactBucket — enforce SSL
+  # =========================================================================
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonSSLRequests
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ArtifactBucket.Arn
+              - !Sub '${ArtifactBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # =========================================================================
+  # IAM role for the Trainium instance
+  # =========================================================================
+  TrainiumRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Explicit role name required for cross-stack references and operational clarity.
+      checkov:
+        skip:
+          - id: CKV_AWS_111
+            comment: S3 resource-scoped actions require wildcard for object keys within the specific bucket.
+    Properties:
+      RoleName: !Sub 'diffusiondrive-role-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: S3ArtifactAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub '${ArtifactBucket.Arn}/*'
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/diffusiondrive/*'
+      Tags:
+        - Key: Project
+          Value: end-2end-AI
+
+  TrainiumInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Explicit profile name required for operational clarity.
+    Properties:
+      InstanceProfileName: !Sub 'diffusiondrive-profile-${AWS::StackName}'
+      Roles:
+        - !Ref TrainiumRole
+
+  # =========================================================================
+  # Security group (AWS Systems Manager only, no SSH by default)
+  # =========================================================================
+  TrainiumSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W40
+            reason: Broad egress required for package repos, S3, and SSM endpoints during training setup.
+          - id: W5
+            reason: Broad egress required for package repos, S3, and SSM endpoints during training setup.
+    Properties:
+      GroupDescription: !Sub 'Security group for DiffusionDrive Trainium instance (${AWS::StackName})'
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS outbound for S3, SSM endpoints, and package repos
+      Tags:
+        - Key: Name
+          Value: !Sub 'diffusiondrive-sg-${AWS::StackName}'
+        - Key: Project
+          Value: end-2end-AI
+
+  # =========================================================================
+  # KMS key for CloudWatch Logs encryption
+  # =========================================================================
+  LogGroupKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'KMS key for DiffusionDrive CloudWatch Logs (${AWS::StackName})'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableRootAccountAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/diffusiondrive/${AWS::StackName}'
+      Tags:
+        - Key: Project
+          Value: end-2end-AI
+
+  LogGroupKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/diffusiondrive-logs-${AWS::StackName}'
+      TargetKeyId: !Ref LogGroupKmsKey
+
+  # =========================================================================
+  # CloudWatch Log Group
+  # =========================================================================
+  BenchmarkLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/diffusiondrive/${AWS::StackName}'
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt LogGroupKmsKey.Arn
+
+  # =========================================================================
+  # Trainium EC2 Instance
+  # =========================================================================
+  TrainiumInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - ArtifactBucket
+      - BenchmarkLogGroup
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref NeuronAmiId
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !GetAtt TrainiumSecurityGroup.GroupId
+      IamInstanceProfile: !Ref TrainiumInstanceProfile
+      KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref 'AWS::NoValue']
+      Monitoring: true
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: !Ref EbsVolumeSize
+            VolumeType: gp3
+            Iops: 6000
+            Encrypted: true
+            DeleteOnTermination: true
+      MetadataOptions:
+        HttpTokens: required          # IMDSv2 enforced
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 2
+      Tags:
+        - Key: Name
+          Value: !Sub 'diffusiondrive-${AWS::StackName}'
+        - Key: Project
+          Value: end-2end-AI
+        - Key: AutoTerminate
+          Value: !Sub '${TTLHours}h'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          exec > >(tee /var/log/diffusiondrive-userdata.log) 2>&1
+          echo "=== DiffusionDrive Trainium Bootstrap ==="
+          echo "Stack: ${AWS::StackName}"
+
+          # IMDSv2 helper: always fetch a fresh token, supply it as a header
+          imds() {
+            local token
+            token=$(curl -sS -X PUT "http://169.254.169.254/latest/api/token" \
+              -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+            curl -sS -H "X-aws-ec2-metadata-token: $token" \
+              "http://169.254.169.254/latest/meta-data/$1"
+          }
+
+          INSTANCE_ID=$(imds instance-id)
+          INSTANCE_TYPE_META=$(imds instance-type)
+          echo "Instance: $INSTANCE_ID"
+          echo "Region: ${AWS::Region}"
+          echo "Start: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          # ---------------------------------------------------------------
+          # 1. Schedule auto-termination (cost safety)
+          # ---------------------------------------------------------------
+          echo "Setting auto-termination in ${TTLHours} hours..."
+          cat > /etc/cron.d/auto-terminate << CRON
+          SHELL=/bin/bash
+          PATH=/usr/local/bin:/usr/bin:/bin
+          $(( $(date +%M) )) $(( ($(date +%H) + ${TTLHours}) % 24 )) * * * root /usr/bin/aws ec2 terminate-instances --instance-ids $INSTANCE_ID --region ${AWS::Region} 2>/dev/null || shutdown -h now
+          CRON
+          # Simpler fallback: shutdown via at
+          echo "shutdown -h now" | at now + ${TTLHours} hours 2>/dev/null || true
+
+          # ---------------------------------------------------------------
+          # 2. Find and activate Neuron virtual environment
+          # ---------------------------------------------------------------
+          NEURON_VENV=""
+          for venv in /opt/aws_neuronx_venv_pytorch_2_8/bin/activate \
+                      /opt/aws_neuronx_venv_pytorch_2_5/bin/activate \
+                      /opt/aws_neuronx_venv_pytorch/bin/activate; do
+            if [ -f "$venv" ]; then
+              NEURON_VENV="$venv"
+              break
+            fi
+          done
+
+          if [ -z "$NEURON_VENV" ]; then
+            echo "ERROR: No Neuron venv found"
+            exit 1
+          fi
+          echo "Using Neuron venv: $NEURON_VENV"
+
+          # Write activation helper
+          cat > /home/ubuntu/activate_neuron.sh << ACTIVATE
+          #!/bin/bash
+          source $NEURON_VENV
+          export NEURON_COMPILE_CACHE_URL="/home/ubuntu/neuron_cache"
+          export NEURON_RT_NUM_CORES=2
+          export NEURON_CC_FLAGS="--optlevel=1"
+          export MALLOC_ARENA_MAX=64
+          ACTIVATE
+          chmod +x /home/ubuntu/activate_neuron.sh
+
+          # ---------------------------------------------------------------
+          # 3. Clone repository and install dependencies
+          # ---------------------------------------------------------------
+          echo "=== Setting up DiffusionDrive project ==="
+          cd /home/ubuntu
+
+          # Clone the repo
+          if [ -d "end-2end-AI" ]; then
+            echo "Project directory exists, pulling latest..."
+            cd end-2end-AI && git pull || true
+          else
+            echo "Cloning from: ${GitRepoUrl}"
+            git clone "${GitRepoUrl}" end-2end-AI
+            cd end-2end-AI
+          fi
+
+          # Install Python deps in Neuron venv
+          source $NEURON_VENV
+          pip install -q numpy scipy scikit-learn Pillow opencv-python-headless \
+            pyquaternion shapely networkx trimesh tensorboard pyyaml tqdm 2>&1 | tail -3
+
+          # Set Neuron env vars
+          export NEURON_COMPILE_CACHE_URL="/home/ubuntu/neuron_cache"
+          export NEURON_RT_NUM_CORES=2
+          export NEURON_CC_FLAGS="--optlevel=1"
+          export MALLOC_ARENA_MAX=64
+          mkdir -p /home/ubuntu/neuron_cache
+
+          # ---------------------------------------------------------------
+          # 4. System info collection
+          # ---------------------------------------------------------------
+          echo "=== System Info ==="
+          echo "Instance type: $INSTANCE_TYPE_META"
+          neuron-ls 2>/dev/null || echo "neuron-ls not available"
+          python3 -c "import torch; print(f'PyTorch: {torch.__version__}')"
+          python3 -c "import torch_xla; print(f'torch_xla: {torch_xla.__version__}')" 2>/dev/null || true
+          python3 -c "import torch_neuronx; print(f'torch_neuronx: {torch_neuronx.__version__}')" 2>/dev/null || true
+
+          # ---------------------------------------------------------------
+          # 5. Run DiffusionDrive benchmark from cloned repo
+          # ---------------------------------------------------------------
+          # Install model dependencies
+          pip install -q timm diffusers 2>&1 | tail -3
+
+          chown -R ubuntu:ubuntu /home/ubuntu/end-2end-AI
+
+          # ---------------------------------------------------------------
+          # 6. Run benchmark (if enabled)
+          # ---------------------------------------------------------------
+          if [ "${RunBenchmark}" = "true" ]; then
+            echo "=== Running DiffusionDrive Benchmark ==="
+            export S3_BUCKET="${ArtifactBucket}"
+            export AWS_DEFAULT_REGION="${AWS::Region}"
+
+            sudo -u ubuntu bash -c "
+              source $NEURON_VENV
+              export NEURON_COMPILE_CACHE_URL=/home/ubuntu/neuron_cache
+              export NEURON_RT_NUM_CORES=2
+              export NEURON_CC_FLAGS='--optlevel=1'
+              export MALLOC_ARENA_MAX=64
+              export S3_BUCKET=${ArtifactBucket}
+              export AWS_DEFAULT_REGION=${AWS::Region}
+              cd /home/ubuntu/end-2end-AI/neuron_diffusiondrive
+              python3 benchmark_neuron.py --freeze_backbone --steps 20 2>&1 | tee /home/ubuntu/benchmark.log
+            "
+
+            # Upload final log to S3
+            aws s3 cp /home/ubuntu/benchmark.log \
+              s3://${ArtifactBucket}/benchmarks/benchmark_$(date -u +%Y%m%d_%H%M%S).log \
+              --region ${AWS::Region} 2>/dev/null || true
+
+            echo "=== Benchmark Complete ==="
+          fi
+
+          # ---------------------------------------------------------------
+          # 7. Signal CloudFormation
+          # ---------------------------------------------------------------
+          echo "=== UserData Complete: $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref TrainiumInstance
+
+  InstancePublicIp:
+    Description: Public IP (if in public subnet)
+    Value: !GetAtt TrainiumInstance.PublicIp
+
+  ArtifactBucketName:
+    Description: S3 bucket for benchmark results and model artifacts
+    Value: !Ref ArtifactBucket
+
+  SSMConnectCommand:
+    Description: Command to connect via SSM (no SSH needed)
+    Value: !Sub 'aws ssm start-session --target ${TrainiumInstance} --region ${AWS::Region}'
+
+  BenchmarkResultsLocation:
+    Description: S3 path for benchmark results
+    Value: !Sub 's3://${ArtifactBucket}/benchmarks/'
+
+  CloudWatchLogsUrl:
+    Description: CloudWatch Logs URL
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/$252Fdiffusiondrive$252F${AWS::StackName}'
+
+  AutoTerminateTime:
+    Description: Instance will auto-terminate after this many hours
+    Value: !Sub '${TTLHours} hours from launch'
+
+  ActivateNeuronCommand:
+    Description: Command to activate Neuron environment on the instance
+    Value: 'source /home/ubuntu/activate_neuron.sh && cd /home/ubuntu/end-2end-AI'

@@ -1,0 +1,25 @@
+{
+  "gpu": "NVIDIA A100-SXM4-40GB",
+  "gpu_memory_gb": 42.4,
+  "peak_memory_gb": 0.4,
+  "backbone": "ResNet-34 (frozen)",
+  "batch_size": 1,
+  "image_size": "256x1024",
+  "bev_grid": "256x256",
+  "total_params_M": 60.7,
+  "trainable_params_M": 8.7,
+  "training": {
+    "avg_step_ms": 43.9,
+    "std_step_ms": 0.6,
+    "throughput_sps": 22.78,
+    "steps": 100
+  },
+  "inference": {
+    "avg_latency_ms": 33.9,
+    "std_latency_ms": 1.4,
+    "p50_latency_ms": 33.1,
+    "p99_latency_ms": 37.0,
+    "throughput_fps": 29.5,
+    "steps": 200
+  }
+}

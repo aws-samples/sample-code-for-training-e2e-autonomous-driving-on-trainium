@@ -1,0 +1,16 @@
+{
+  "model": "DiffusionDrive",
+  "backbone": "ResNet-34 (frozen)",
+  "batch_size": 1,
+  "image_size": "256x1024",
+  "bev_grid": "256x256",
+  "diffusion_steps": 2,
+  "trajectory_modes": 20,
+  "total_params_M": 60.7,
+  "trainable_params_M": 8.7,
+  "compile_time_s": 204.1,
+  "avg_step_ms": 78.3,
+  "std_step_ms": 0.4,
+  "throughput_sps": 12.76,
+  "steps": 20
+}

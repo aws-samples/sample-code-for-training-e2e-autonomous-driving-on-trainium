@@ -1,0 +1,8 @@
+# Checkov configuration for this repository.
+#
+# CKV_AWS_18: "Ensure the S3 bucket has access logging enabled"
+# Skipped globally because this repo contains a bucket that is itself the
+# access-log destination for another bucket. Enabling access logging on the
+# log bucket would create recursive self-logging.
+skip-check:
+  - CKV_AWS_18
